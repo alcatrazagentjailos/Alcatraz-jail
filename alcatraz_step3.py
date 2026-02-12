@@ -204,7 +204,7 @@ class ToolGate:
 # AGENT CELL + CONTROLLER
 # =========================================================
 
-def agent_cell(code, cap_dict, audit_path, kq, rq):
+def agent_cell(code, cap_dict, audit_path, kq, rq,task=None):
     audit = AuditLog(audit_path)
     caps = CapabilitySet({
         k: Capability(k, v["expires"], v["scope"])
@@ -217,7 +217,7 @@ def agent_cell(code, cap_dict, audit_path, kq, rq):
         env = {
             "__builtins__": {"print": print},
             "TOOLS": tools,
-            "TASK": {},
+            "TASK": task if task else {},
         }
         exec(code, env, env)
         out = env["run"](env["TASK"], tools)
@@ -225,7 +225,7 @@ def agent_cell(code, cap_dict, audit_path, kq, rq):
     except Exception as e:
         rq.put({"ok": False, "error": str(e)})
 
-def run_agent(code, grants):
+def run_agent(code, grants,task=None):
     audit = AuditLog()
     now = time.time()
     cap_dict = {
@@ -235,7 +235,7 @@ def run_agent(code, grants):
     kq, rq = Queue(), Queue()
     p = Process(
         target=agent_cell,
-        args=(code, cap_dict, audit.path, kq, rq),
+        args=(code, cap_dict, audit.path, kq, rq,task),
         daemon=True,
     )
     p.start()
@@ -251,31 +251,31 @@ if __name__ == "__main__":
 
     AGENT_CODE = r'''
 def run(TASK, TOOLS):
-    return TOOLS.bankr_prompt("What is the price of ETH on solana?")
+    token = TASK.get("token", "SOL") 
+    return TOOLS.bankr_prompt(f"What is the price of {token} on Solana?") 
 '''
 
     result = run_agent(
-    AGENT_CODE,
-    grants=[
-        ("bankr.use", 60, {
-            "blocked_actions": [
-                # ---- existing blocked actions ----
-                "transfer",
-                "withdraw",
-                "approve",
-                "bridge",
-                "stake",
-                "unstake",
-                "base",
-                "ethereum",
-                "bsc",
-                "polygon",
-            ],
-            "max_calls_per_min": 5,
-            "poll_timeout_s": 60,
-        })
-    ],
-)
+        AGENT_CODE,
+        grants=[
+            ("bankr.use", 60, {
+                "blocked_actions": [
+                    "transfer",
+                    "withdraw",
+                    "approve",
+                    "bridge",
+                    "stake",
+                    "unstake",
+                    "base",
+                    "ethereum",
+                    "bsc",
+                    "polygon",
+                ],
+                "max_calls_per_min": 5,
+                "poll_timeout_s": 60,
+            })
+        ],
+        task={"token": "BONK"}
+    )
 
-print("RESULT:", result)
-
+    print("RESULT:", result)
