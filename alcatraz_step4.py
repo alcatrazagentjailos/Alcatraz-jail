@@ -236,26 +236,26 @@ class ToolGate:
 # AGENT CELL + CONTROLLER
 # =========================================================
 
-def agent_cell(code, cap_dict, audit_path, kq, rq):
+def agent_cell(code, cap_dict, audit_path, kq, rq,task=None):
     audit = AuditLog(audit_path)
     caps = CapabilitySet({k: Capability(k, v["expires"], v["scope"]) for k, v in cap_dict.items()})
     kill = KillSwitch(audit, kq)
     tools = ToolGate(caps, audit, kill)
 
     try:
-        env = {"__builtins__": {"print": print}, "TOOLS": tools, "TASK": {}}
+        env = {"__builtins__": {"print": print}, "TOOLS": tools, "TASK": task if task else {}}
         exec(code, env, env)
         out = env["run"](env["TASK"], tools)
         rq.put({"ok": True, "output": out})
     except Exception as e:
         rq.put({"ok": False, "error": str(e)})
 
-def run_agent(code, grants):
+def run_agent(code, grants,task=None):
     audit = AuditLog()
     now = time.time()
     cap_dict = {n: {"expires": now + ttl, "scope": scope} for n, ttl, scope in grants}
     kq, rq = Queue(), Queue()
-    p = Process(target=agent_cell, args=(code, cap_dict, audit.path, kq, rq), daemon=True)
+    p = Process(target=agent_cell, args=(code, cap_dict, audit.path, kq, rq,task), daemon=True)
     p.start()
     p.join(90)
     return rq.get()
