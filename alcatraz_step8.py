@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-ALCATRAZ Agent Jail OS — STEP 8 (Human Approval Gate) — FIXED
+ALCATRAZ Agent Jail OS — STEP 8 (Human Approval Gate) — COMPLETE FIXED
 
-✔ Separate queues (no race condition)
-✔ One-time approval tokens
-✔ Timeout enforcement
-✔ Full audit trail
+✅ Step 1: Blocked intents
+✅ Step 2: Rate limiting
+✅ Step 3: Polling timeout
+✅ Step 4: Chain allowlist (Solana only)
+✅ Step 5: Max USD ($100)
+✅ Step 6: Read vs Trade mode
+✅ Step 7: Dry-run vs Live execution
+✅ Step 8: Human approval gate
 
 Run:
-  python3 alcatraz_step8_fixed.py
+  python3 alcatraz_step8_complete.py
 """
 
 from __future__ import annotations
@@ -21,68 +25,42 @@ from dataclasses import dataclass, field
 from typing import Dict, Any
 
 
-# =========================================================
-# AUDIT LOG
-# =========================================================
-
 class AuditLog:
     def __init__(self, path="./audit/alcatraz.jsonl"):
         self.path = path
         os.makedirs(os.path.dirname(path), exist_ok=True)
-
     def write(self, event, **data):
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps({"ts": time.time(), "event": event, **data}) + "\n")
 
 
-# =========================================================
-# CAPABILITIES
-# =========================================================
-
-class PolicyViolation(Exception):
-    pass
+class PolicyViolation(Exception): pass
 
 @dataclass
 class Capability:
-    name: str
-    expires: float
-    scope: Dict[str, Any]
-
-    def valid(self):
-        return time.time() <= self.expires
+    name: str; expires: float; scope: Dict[str, Any]
+    def valid(self): return time.time() <= self.expires
 
 @dataclass
 class CapabilitySet:
     caps: Dict[str, Capability] = field(default_factory=dict)
-
     def require(self, name):
         cap = self.caps.get(name)
-        if not cap:
-            raise PolicyViolation(f"CAP_MISSING:{name}")
-        if not cap.valid():
-            raise PolicyViolation(f"CAP_EXPIRED:{name}")
+        if not cap: raise PolicyViolation(f"CAP_MISSING:{name}")
+        if not cap.valid(): raise PolicyViolation(f"CAP_EXPIRED:{name}")
         return cap
 
-
-# =========================================================
-# KILL SWITCH
-# =========================================================
 
 class KillSwitch:
     def __init__(self, audit: AuditLog):
         self.audit = audit
         self.tripped = False
-
     def trip(self, reason: str):
         if not self.tripped:
             self.tripped = True
             self.audit.write("CELL_KILLED", reason=reason)
         raise PolicyViolation(reason)
 
-
-# =========================================================
-# TOOL GATE — STEP 8 (FIXED)
-# =========================================================
 
 class ToolGate:
     def __init__(
@@ -98,7 +76,7 @@ class ToolGate:
         self.kill = kill
         self.approval_req_q = approval_req_q
         self.approval_res_q = approval_res_q
-        self.calls = []
+        self._bankr_call_times = []
 
     def _require_human_approval(self, cap: Capability, prompt: str):
         token = f"appr_{int(time.time())}_{os.getpid()}"
@@ -111,7 +89,6 @@ class ToolGate:
             timeout_s=timeout_s,
         )
 
-        # Send request to controller
         self.approval_req_q.put({
             "token": token,
             "prompt": prompt,
@@ -141,41 +118,128 @@ class ToolGate:
         cap = self.caps.require("bankr.use")
         p = prompt.lower()
 
-        # Detect trade intent
-        trade_words = ["buy", "sell", "swap", "transfer", "approve", "bridge", "stake"]
-        is_trade = any(w in p for w in trade_words)
+        # ---------------- STEP 2: RATE LIMIT ----------------
+        now = time.time()
+        self._bankr_call_times = [t for t in self._bankr_call_times if now - t < 60]
+        max_calls = int(cap.scope.get("max_calls_per_min", 0))
+        if max_calls and len(self._bankr_call_times) >= max_calls:
+            self.kill.trip("BANKR_DENIED:RATE_LIMIT")
+        self._bankr_call_times.append(now)
 
-        # STEP 8 — require approval for trades
+        # ---------------- STEP 1: ALWAYS BLOCKED ACTIONS ----------------
+        always_blocked = ["transfer", "withdraw", "approve", "bridge", "stake", "unstake"]
+        for bad in always_blocked:
+            if bad in p:
+                self.kill.trip(f"BANKR_BLOCKED_ACTION:{bad}")
+
+        # ---------------- STEP 4: CHAIN ALLOWLIST (SOLANA ONLY) ----------------
+        allowed_chains = [c.lower() for c in cap.scope.get("allowed_chains", ["solana"])]
+        chains = {
+            "ethereum": ["ethereum", "eth", "mainnet"],
+            "base": ["base"],
+            "solana": ["solana", "sol"],
+            "bsc": ["bsc", "binance"],
+            "polygon": ["polygon", "matic"],
+        }
+        mentioned = None
+        for chain, aliases in chains.items():
+            if any(a in p for a in aliases):
+                mentioned = chain
+                break
+        if mentioned and allowed_chains and mentioned not in allowed_chains:
+            self.kill.trip(f"BANKR_DENIED:CHAIN_NOT_ALLOWED:{mentioned}")
+
+        # ---------------- STEP 6: READ vs TRADE MODE ----------------
+        mode = cap.scope.get("mode", "read")
+        trade_words = ["buy", "sell", "swap"]
+        
+        if mode == "read":
+            for word in trade_words:
+                if word in p:
+                    self.kill.trip("BANKR_DENIED:READ_ONLY_MODE")
+
+        # ---------------- STEP 7: DRY-RUN vs LIVE EXECUTION ----------------
+        execution = cap.scope.get("execution", "dry_run")
+        if execution == "dry_run":
+            for word in trade_words:
+                if word in p:
+                    self.audit.write(
+                        "tool_denied",
+                        tool="bankr",
+                        reason="live_action_in_dry_run",
+                        execution=execution,
+                        keyword=word,
+                        prompt=prompt,
+                    )
+                    self.kill.trip("BANKR_DENIED:DRY_RUN_ONLY")
+
+        # ---------------- STEP 5: MAX USD -------------------
+        max_usd = float(cap.scope.get("max_usd", 0))
+        if max_usd > 0:
+            amounts = re.findall(r"\$?\s?(\d+(?:,\d{3})*(?:\.\d+)?)\s?(usd|dollars)?", p)
+            for amt, _ in amounts:
+                value = float(amt.replace(",", ""))
+                if value > max_usd:
+                    self.kill.trip("BANKR_DENIED:MAX_USD_EXCEEDED")
+
+        # ---------------- STEP 8: HUMAN APPROVAL ----------------
+        is_trade = any(word in p for word in trade_words)
         if is_trade and cap.scope.get("approval_required", False):
             self._require_human_approval(cap, prompt)
 
         self.audit.write("tool_attempt", tool="bankr", prompt=prompt)
 
+        # ---------------- BANKR CALL -------------------------
         api_key = os.environ.get("BANKR_API_KEY")
         if not api_key:
             self.kill.trip("BANKR_API_KEY_MISSING")
 
+        bankr_base = "https://api.bankr.bot"
+        
         req = urllib.request.Request(
-            "https://api.bankr.bot/agent/prompt",
+            f"{bankr_base}/agent/prompt",
             data=json.dumps({"prompt": prompt}).encode(),
-            headers={
-                "X-API-Key": api_key,
-                "Content-Type": "application/json",
-            },
+            headers={"X-API-Key": api_key, "Content-Type": "application/json"},
             method="POST",
         )
 
-        with urllib.request.urlopen(req, timeout=10) as r:
-            job = json.loads(r.read().decode())
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                job = json.loads(r.read().decode())
+        except Exception as e:
+            self.kill.trip(f"BANKR_HTTP_ERROR:{e}")
 
-        return job
+        job_id = job.get("jobId")
+        if not job_id:
+            self.kill.trip("BANKR_NO_JOB_ID")
+
+        # ---------------- STEP 3: POLLING TIMEOUT -------------
+        start = time.time()
+        timeout = int(cap.scope.get("poll_timeout_s", 60))
+
+        while True:
+            if time.time() - start > timeout:
+                self.kill.trip("BANKR_DENIED:POLL_TIMEOUT")
+
+            try:
+                poll_req = urllib.request.Request(
+                    f"{bankr_base}/agent/job/{job_id}",
+                    headers={"X-API-Key": api_key},
+                )
+                with urllib.request.urlopen(poll_req, timeout=10) as r:
+                    res = json.loads(r.read().decode())
+            except Exception as e:
+                self.kill.trip(f"BANKR_POLL_ERROR:{e}")
+
+            if res.get("status") == "completed":
+                return res
+            if res.get("status") in ("failed", "cancelled", "error"):
+                self.kill.trip(f"BANKR_JOB_{res.get('status').upper()}")
+
+            time.sleep(2)
 
 
-# =========================================================
-# AGENT + CONTROLLER
-# =========================================================
-
-def agent_cell(code, cap_dict, audit_path, approval_req_q, approval_res_q, result_q):
+def agent_cell(code, cap_dict, audit_path, approval_req_q, approval_res_q, result_q, task=None):
     audit = AuditLog(audit_path)
     caps = CapabilitySet({
         k: Capability(k, v["expires"], v["scope"])
@@ -185,15 +249,19 @@ def agent_cell(code, cap_dict, audit_path, approval_req_q, approval_res_q, resul
     tools = ToolGate(caps, audit, kill, approval_req_q, approval_res_q)
 
     try:
-        env = {"__builtins__": {"print": print}, "TOOLS": tools}
+        env = {
+            "__builtins__": {"print": print}, 
+            "TOOLS": tools,
+            "TASK": task if task else {}
+        }
         exec(code, env, env)
-        out = env["run"]({}, tools)
+        out = env["run"](env["TASK"], tools)
         result_q.put({"ok": True, "output": out})
     except Exception as e:
         result_q.put({"ok": False, "error": str(e)})
 
 
-def run_agent(code, grants):
+def run_agent(code, grants, task=None):
     now = time.time()
     cap_dict = {
         name: {"expires": now + ttl, "scope": scope}
@@ -207,7 +275,7 @@ def run_agent(code, grants):
     p = Process(
         target=agent_cell,
         args=(code, cap_dict, "./audit/alcatraz.jsonl",
-              approval_req_q, approval_res_q, result_q),
+              approval_req_q, approval_res_q, result_q, task),
         daemon=True,
     )
     p.start()
@@ -227,37 +295,70 @@ def run_agent(code, grants):
             prompt = req["prompt"]
             timeout_s = req["timeout_s"]
 
-            print("\n=== HUMAN APPROVAL REQUIRED ===")
-            print("Prompt:", prompt)
-            print("To approve:  APPROVE", token)
-            print("To deny:     DENY", token)
-            print(f"(auto-timeout in {timeout_s}s)\n")
+            print("\n" + "="*50)
+            print("🧑‍⚖️ HUMAN APPROVAL REQUIRED")
+            print("="*50)
+            print(f"📝 Prompt: {prompt}")
+            print(f"⏳ Timeout: {timeout_s}s")
+            print(f"🆔 Token: {token}")
+            print("\n✅ Approve: APPROVE " + token)
+            print("❌ Deny:    DENY " + token)
+            print("="*50)
 
             user = input("> ").strip()
             if user == f"APPROVE {token}":
                 approval_res_q.put({"token": token, "decision": "approve"})
+                print("✅ Approved!\n")
             else:
                 approval_res_q.put({"token": token, "decision": "deny"})
+                print("❌ Denied!\n")
 
         time.sleep(0.05)
 
 
 # =========================================================
-# DEMO
+# DEMO - STEP 8 COMPLETE
 # =========================================================
 
 if __name__ == "__main__":
+    import os
+    
+    # ENV se settings
+    PROMPT = os.environ.get("TEST_PROMPT", "What is the price of SOL on Solana?")
+    MODE = os.environ.get("MODE", "read")
+    EXECUTION = os.environ.get("EXECUTION", "dry_run")
+    APPROVAL_REQUIRED = os.environ.get("APPROVAL_REQUIRED", "true").lower() == "true"
+    
+    print("\n" + "="*50)
+    print("🏰 ALCATRAZ JAIL OS - STEP 8")
+    print("="*50)
+    print(f"🎯 Mode: {MODE.upper()}")
+    print(f"⚡ Execution: {EXECUTION.upper()}")
+    print(f"🧑‍⚖️ Human Approval: {'REQUIRED' if APPROVAL_REQUIRED else 'NOT REQUIRED'}")
+    print(f"📝 Prompt: {PROMPT}")
+    print(f"⛓️ Chain: Solana Only")
+    print(f"💰 Max USD: $100")
+    print(f"🔄 Rate Limit: 5/min")
+    print("="*50 + "\n")
 
-    AGENT_CODE = r'''
+    AGENT_CODE = rf'''
 def run(TASK, TOOLS):
-    return TOOLS.bankr_prompt("Buy $50 ETH on Base")
+    return TOOLS.bankr_prompt("{PROMPT}")
 '''
 
     result = run_agent(
         AGENT_CODE,
         grants=[
             ("bankr.use", 120, {
-                "approval_required": True,
+                # Step 1-7 settings
+                "mode": MODE,
+                "execution": EXECUTION,
+                "allowed_chains": ["solana"],
+                "max_calls_per_min": 5,
+                "max_usd": 100,
+                "poll_timeout_s": 60,
+                # Step 8 settings
+                "approval_required": APPROVAL_REQUIRED,
                 "approval_timeout_s": 30,
             })
         ],
