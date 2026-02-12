@@ -192,24 +192,25 @@ class ToolGate:
 # AGENT + CONTROLLER
 # =========================================================
 
-def agent_cell(code, cap_dict, audit_path, kq, rq):
+def agent_cell(code, cap_dict, audit_path, kq, rq,task=None):
     audit = AuditLog(audit_path)
     caps = CapabilitySet({k: Capability(k, v["expires"], v["scope"]) for k, v in cap_dict.items()})
     kill = KillSwitch(audit, kq)
     tools = ToolGate(caps, audit, kill)
 
     try:
-        env = {"__builtins__": {"print": print}, "TOOLS": tools}
+        env = {"__builtins__": {"print": print}, "TOOLS": tools,"TASK": task if task else {} }
         exec(code, env, env)
-        rq.put({"ok": True, "output": env["run"]({}, tools)})
+        out = env["run"](env["TASK"], tools) 
+        rq.put({"ok": True, "output": out})
     except Exception as e:
         rq.put({"ok": False, "error": str(e)})
 
-def run_agent(code, grants):
+def run_agent(code, grants,task=None):
     now = time.time()
     cap_dict = {n: {"expires": now + ttl, "scope": scope} for n, ttl, scope in grants}
     kq, rq = Queue(), Queue()
-    p = Process(target=agent_cell, args=(code, cap_dict, "./audit/alcatraz.jsonl", kq, rq))
+    p = Process(target=agent_cell, args=(code, cap_dict, "./audit/alcatraz.jsonl", kq, rq,task))
     p.start()
     p.join(90)
     return rq.get()
@@ -240,12 +241,12 @@ def run(TASK, TOOLS):
 
     # Allow overriding max USD via env for tests
     try:
-        MAX_USD = float(os.environ.get("MAX_USD", "101"))
+        MAX_USD = float(os.environ.get("MAX_USD", "100"))
     except Exception:
         MAX_USD = 101.0
 
     try:
-        POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "3"))
+        POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "30"))
     except Exception:
         POLL_TIMEOUT = 3
 
@@ -255,7 +256,6 @@ def run(TASK, TOOLS):
             ("bankr.use", 60, {
                 "blocked_actions": ["transfer", "withdraw", "approve", "bridge"],
                 "max_calls_per_min": 5,
-                "poll_timeout_s": 60,
                 "allowed_chains": ALLOWED_CHAINS,
                 "max_usd": MAX_USD,
                 "poll_timeout_s": POLL_TIMEOUT,
