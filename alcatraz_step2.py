@@ -174,7 +174,7 @@ class ToolGate:
 # AGENT CELL
 # =========================================================
 
-def agent_cell(code, cap_dict, audit_path, kill_q, res_q):
+def agent_cell(code, cap_dict, audit_path, kill_q, res_q,task=None):
     audit = AuditLog(audit_path)
 
     caps = CapabilitySet({
@@ -189,7 +189,7 @@ def agent_cell(code, cap_dict, audit_path, kill_q, res_q):
         env = {
             "__builtins__": {"print": print, "len": len, "str": str},
             "TOOLS": tools,
-            "TASK": {},
+            "TASK": task if task else {},
         }
         exec(code, env, env)
         out = env["run"](env["TASK"], tools)
@@ -203,7 +203,7 @@ def agent_cell(code, cap_dict, audit_path, kill_q, res_q):
 # CONTROLLER
 # =========================================================
 
-def run_agent(code, grants):
+def run_agent(code, grants,task=None):
     audit = AuditLog()
     now = time.time()
 
@@ -215,7 +215,7 @@ def run_agent(code, grants):
     kq, rq = Queue(), Queue()
     p = Process(
         target=agent_cell,
-        args=(code, cap_dict, audit.path, kq, rq),
+        args=(code, cap_dict, audit.path, kq, rq,task),
         daemon=True,
     )
     p.start()
@@ -230,9 +230,10 @@ def run_agent(code, grants):
 
 if __name__ == "__main__":
 
-    AGENT_CODE = r'''
+   AGENT_CODE = r'''
 def run(TASK, TOOLS):
-    return TOOLS.bankr_prompt("What is the price of ETH on Base?")
+    token = TASK.get("token", "SOL")  
+    return TOOLS.bankr_prompt(f"What is the price of {token} on Solana?")
 '''
 
     result = run_agent(
@@ -250,6 +251,7 @@ def run(TASK, TOOLS):
                 "max_calls_per_min": 5,
             })
         ],
+       task={"token": "BONK"}
     )
 
     print("RESULT:", result)
