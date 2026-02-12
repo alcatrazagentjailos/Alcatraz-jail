@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 """
 ALCATRAZ Agent Jail OS — Step 6 (Read vs Trade Mode)
-
-Includes:
-- Step 1: Blocked intents
-- Step 2: Rate limiting
-- Step 3: Polling timeout
-- Step 4: Chain allowlist
-- Step 5: Max USD value
-- Step 6: Read-only vs Trade mode
-
-Run:
-  python3 alcatraz_step6.py
+- Solana chain only
+- Always block: transfer/withdraw/approve/bridge/stake
+- Read mode: sirf price check
+- Trade mode: buy/sell/swap allowed
+- Max USD: $100
+- Auto-detect mode from prompt!
 """
 
 from __future__ import annotations
@@ -87,77 +82,113 @@ class ToolGate:
         self.caps = caps
         self.audit = audit
         self.kill = kill
-        self.calls = []
+        self._bankr_call_times = []
 
     def bankr_prompt(self, prompt: str) -> dict:
         cap = self.caps.require("bankr.use")
         p = prompt.lower()
 
-        # STEP 2 — RATE LIMIT
+        # ---------------- STEP 2: RATE LIMIT ----------------
         now = time.time()
-        self.calls = [t for t in self.calls if now - t < 60]
-        if len(self.calls) >= cap.scope.get("max_calls_per_min", 0):
+        self._bankr_call_times = [t for t in self._bankr_call_times if now - t < 60]
+        max_calls = int(cap.scope.get("max_calls_per_min", 0))
+        if max_calls and len(self._bankr_call_times) >= max_calls:
             self.kill.trip("BANKR_DENIED:RATE_LIMIT")
-        self.calls.append(now)
+        self._bankr_call_times.append(now)
 
-        # STEP 6 — READ vs TRADE MODE
-        trade_words = ["swap", "buy", "sell", "transfer", "approve", "bridge", "stake"]
+        # ---------------- STEP 1: ALWAYS BLOCKED ACTIONS ----------------
+        always_blocked = ["transfer", "withdraw", "approve", "bridge", "stake", "unstake"]
+        for bad in always_blocked:
+            if bad in p:
+                self.kill.trip(f"BANKR_BLOCKED_ACTION:{bad}")
+
+        # ---------------- STEP 4: CHAIN ALLOWLIST ----------------
+        allowed_chains = [c.lower() for c in cap.scope.get("allowed_chains", ["solana"])]
+        chains = {
+            "ethereum": ["ethereum", "eth", "mainnet"],
+            "base": ["base"],
+            "solana": ["solana", "sol"],
+            "bsc": ["bsc", "binance"],
+            "polygon": ["polygon", "matic"],
+        }
+        mentioned = None
+        for chain, aliases in chains.items():
+            if any(a in p for a in aliases):
+                mentioned = chain
+                break
+        if mentioned and allowed_chains and mentioned not in allowed_chains:
+            self.kill.trip(f"BANKR_DENIED:CHAIN_NOT_ALLOWED:{mentioned}")
+
+        # ---------------- STEP 6: READ vs TRADE MODE ----------------
         mode = cap.scope.get("mode", "read")
+        # Sirf yeh trade words hain - transfer/approve etc already blocked
+        trade_words = ["swap", "buy", "sell"]
+        
+        if mode == "read":
+            for word in trade_words:
+                if word in p:
+                    self.kill.trip("BANKR_DENIED:READ_ONLY_MODE")
+        # Trade mode mein sab allow hai - kuch block nahi
 
-        if mode == "read" and any(w in p for w in trade_words):
-            self.audit.write(
-                "tool_denied",
-                tool="bankr",
-                reason="trade_in_read_mode",
-                prompt=prompt,
-            )
-            self.kill.trip("BANKR_DENIED:READ_ONLY_MODE")
-
-        # STEP 4 — CHAIN ALLOWLIST
-        allowed = cap.scope.get("allowed_chains", [])
-        if "ethereum" in p and "ethereum" not in allowed:
-            self.kill.trip("BANKR_DENIED:CHAIN_NOT_ALLOWED:ethereum")
-
-        # STEP 5 — MAX USD
-        max_usd = cap.scope.get("max_usd", 0)
-        if max_usd:
-            amounts = re.findall(r"\$?\s?(\d+(?:,\d{3})*)", p)
-            for a in amounts:
-                if float(a.replace(",", "")) > max_usd:
+        # ---------------- STEP 5: MAX USD -------------------
+        max_usd = float(cap.scope.get("max_usd", 0))
+        if max_usd > 0:
+            amounts = re.findall(r"\$?\s?(\d+(?:,\d{3})*(?:\.\d+)?)\s?(usd|dollars)?", p)
+            for amt, _ in amounts:
+                value = float(amt.replace(",", ""))
+                if value > max_usd:
                     self.kill.trip("BANKR_DENIED:MAX_USD_EXCEEDED")
 
-        # BANKR CALL
+        self.audit.write("tool_attempt", tool="bankr", prompt=prompt)
+
+        # ---------------- BANKR CALL -------------------------
         api_key = os.environ.get("BANKR_API_KEY")
         if not api_key:
             self.kill.trip("BANKR_API_KEY_MISSING")
 
+        # ✅ SAHI URL - /v1 HATAYA!
+        bankr_base = "https://api.bankr.bot"
+        
         req = urllib.request.Request(
-            "https://api.bankr.bot/agent/prompt",
+            f"{bankr_base}/agent/prompt",
             data=json.dumps({"prompt": prompt}).encode(),
             headers={"X-API-Key": api_key, "Content-Type": "application/json"},
             method="POST",
         )
 
-        with urllib.request.urlopen(req) as r:
-            job = json.loads(r.read())
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                job = json.loads(r.read().decode())
+        except Exception as e:
+            self.kill.trip(f"BANKR_HTTP_ERROR:{e}")
 
         job_id = job.get("jobId")
-        start = time.time()
+        if not job_id:
+            self.kill.trip("BANKR_NO_JOB_ID")
 
-        # STEP 3 — POLLING TIMEOUT
+        # ---------------- STEP 3: POLLING TIMEOUT -------------
+        start = time.time()
+        timeout = int(cap.scope.get("poll_timeout_s", 60))
+
         while True:
-            if time.time() - start > cap.scope.get("poll_timeout_s", 60):
+            if time.time() - start > timeout:
                 self.kill.trip("BANKR_DENIED:POLL_TIMEOUT")
 
-            poll = urllib.request.Request(
-                f"https://api.bankr.bot/agent/job/{job_id}",
-                headers={"X-API-Key": api_key},
-            )
-            with urllib.request.urlopen(poll) as r:
-                res = json.loads(r.read())
+            try:
+                poll_req = urllib.request.Request(
+                    f"{bankr_base}/agent/job/{job_id}",
+                    headers={"X-API-Key": api_key},
+                )
+                with urllib.request.urlopen(poll_req, timeout=10) as r:
+                    res = json.loads(r.read().decode())
+            except Exception as e:
+                self.kill.trip(f"BANKR_POLL_ERROR:{e}")
 
             if res.get("status") == "completed":
                 return res
+            if res.get("status") in ("failed", "cancelled", "error"):
+                self.kill.trip(f"BANKR_JOB_{res.get('status').upper()}")
+
             time.sleep(2)
 
 
@@ -165,44 +196,73 @@ class ToolGate:
 # AGENT + CONTROLLER
 # =========================================================
 
-def agent_cell(code, cap_dict, audit_path, kq, rq):
+def agent_cell(code, cap_dict, audit_path, kq, rq, task=None):
     audit = AuditLog(audit_path)
     caps = CapabilitySet({k: Capability(k, v["expires"], v["scope"]) for k, v in cap_dict.items()})
     kill = KillSwitch(audit, kq)
     tools = ToolGate(caps, audit, kill)
+    
     try:
-        env = {"__builtins__": {"print": print}, "TOOLS": tools}
+        env = {
+            "__builtins__": {"print": print}, 
+            "TOOLS": tools,
+            "TASK": task if task else {}
+        }
         exec(code, env, env)
-        rq.put({"ok": True, "output": env["run"]({}, tools)})
+        out = env["run"](env["TASK"], tools)
+        rq.put({"ok": True, "output": out})
     except Exception as e:
         rq.put({"ok": False, "error": str(e)})
 
-def run_agent(code, grants):
+
+def run_agent(code, grants, task=None):
+    audit = AuditLog()
     now = time.time()
     cap_dict = {n: {"expires": now + ttl, "scope": scope} for n, ttl, scope in grants}
     kq, rq = Queue(), Queue()
-    p = Process(target=agent_cell, args=(code, cap_dict, "./audit/alcatraz.jsonl", kq, rq))
-    p.start(); p.join(90)
+    p = Process(
+        target=agent_cell,
+        args=(code, cap_dict, audit.path, kq, rq, task),
+        daemon=True,
+    )
+    p.start()
+    p.join(90)
     return rq.get()
 
 
 # =========================================================
-# DEMO
+# DEMO - AUTO DETECT MODE FROM PROMPT! 🎯
 # =========================================================
 
 if __name__ == "__main__":
-
-    AGENT_CODE = r'''
+    import os
+    
+    # ENV se prompt lo
+    PROMPT = os.environ.get("TEST_PROMPT", "What is the price of SOL on Solana?")
+    
+    # 🎯🎯🎯 AUTO-DETECT MODE - DONO MODES ON! 🎯🎯🎯
+    trade_words = ["buy", "sell", "swap", "purchase", "acquire"]
+    MODE = "trade" if any(word in PROMPT.lower() for word in trade_words) else "read"
+    
+    print("="*50)
+    print(f"🎯 MODE: {MODE.upper()}")
+    print(f"📝 PROMPT: {PROMPT}")
+    print(f"⛓️ CHAIN: Solana Only")
+    print(f"💰 MAX USD: $100")
+    print(f"🔄 RATE LIMIT: 5/min")
+    print("="*50)
+    
+    AGENT_CODE = rf'''
 def run(TASK, TOOLS):
-    return TOOLS.bankr_prompt("What is the price of ETH on Base?")
+    return TOOLS.bankr_prompt("{PROMPT}")
 '''
 
     result = run_agent(
         AGENT_CODE,
         grants=[
             ("bankr.use", 60, {
-                "mode": "read",                # ✅ STEP 6
-                "allowed_chains": ["base"],
+                "mode": MODE,  # 🎯 AUTO-DETECTED!
+                "allowed_chains": ["solana"],
                 "max_calls_per_min": 5,
                 "max_usd": 100,
                 "poll_timeout_s": 60,
