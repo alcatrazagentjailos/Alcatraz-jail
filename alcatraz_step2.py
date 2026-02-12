@@ -174,7 +174,7 @@ class ToolGate:
 # AGENT CELL
 # =========================================================
 
-def agent_cell(code, cap_dict, audit_path, kill_q, res_q,task=None):
+def agent_cell(code, cap_dict, audit_path, kill_q, res_q, task=None):
     audit = AuditLog(audit_path)
 
     caps = CapabilitySet({
@@ -203,7 +203,7 @@ def agent_cell(code, cap_dict, audit_path, kill_q, res_q,task=None):
 # CONTROLLER
 # =========================================================
 
-def run_agent(code, grants,task=None):
+def run_agent(code, grants, task=None):
     audit = AuditLog()
     now = time.time()
 
@@ -215,7 +215,7 @@ def run_agent(code, grants,task=None):
     kq, rq = Queue(), Queue()
     p = Process(
         target=agent_cell,
-        args=(code, cap_dict, audit.path, kq, rq,task),
+        args=(code, cap_dict, audit.path, kq, rq, task),
         daemon=True,
     )
     p.start()
@@ -230,7 +230,7 @@ def run_agent(code, grants,task=None):
 
 if __name__ == "__main__":
 
-   AGENT_CODE = r'''
+    AGENT_CODE = r'''
 def run(TASK, TOOLS):
     token = TASK.get("token", "SOL")  
     return TOOLS.bankr_prompt(f"What is the price of {token} on Solana?")
@@ -251,7 +251,7 @@ def run(TASK, TOOLS):
                 "max_calls_per_min": 5,
             })
         ],
-       task={"token": "BONK"}
+        task={"token": "BONK"}
     )
 
     print("RESULT:", result)
