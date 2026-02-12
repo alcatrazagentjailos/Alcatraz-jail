@@ -223,7 +223,7 @@ def run_agent(code, grants,task=None):
 if __name__ == "__main__":
     import os
 
-    TEST_PROMPT = os.environ.get("TEST_PROMPT", "What is the price of SOL on Solana devnet for $10?")
+    TEST_PROMPT = os.environ.get("TEST_PROMPT", "What is the price of SOL on Solana for $10?")
     ALLOWED_CHAINS_ENV = os.environ.get("ALLOWED_CHAINS", "solana")
     ALLOWED_CHAINS = [c.strip().lower() for c in ALLOWED_CHAINS_ENV.split(",") if c.strip()]
 
