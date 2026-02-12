@@ -246,7 +246,7 @@ def run(TASK, TOOLS):
         MAX_USD = 101.0
 
     try:
-        POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "30"))
+        POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "60"))
     except Exception:
         POLL_TIMEOUT = 3
 
